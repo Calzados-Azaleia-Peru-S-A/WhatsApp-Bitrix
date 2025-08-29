@@ -1,72 +1,111 @@
 // src/webhooks/whatsapp.js
-const { normalizeToE164 } = require('../utils/phone');
-const { saveInboundMessage, saveStatus } = require('../services/statusStore');
-const { ensureContactByPhone } = require('../services/contacts');
+// Webhook de WhatsApp Cloud: verify + inbound -> Bitrix (imconnector.receiveMessage)
 
-const VERIFY_TOKEN = process.env.WSP_VERIFY_TOKEN || 'test123';
-const MARK_READ = String(process.env.WSP_MARK_READ || '1') === '1';
+const { appendInbound, appendStatus } = require('../services/statusStore');
+const { normalizeToE164, stripPlus } = require('../utils/phone');
+const { call } = require('../services/b24client');
 
+/**
+ * GET /webhooks/whatsapp (challenge)
+ */
 async function getVerify(req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+  if (mode === 'subscribe' && token === process.env.WSP_VERIFY_TOKEN && challenge) {
     return res.status(200).send(challenge);
   }
-  res.sendStatus(403);
+  return res.status(403).send('forbidden');
 }
 
+/**
+ * POST /webhooks/whatsapp
+ * Maneja mensajes entrantes y estados.
+ * Empuja mensajes entrantes a Bitrix: imconnector.receiveMessage
+ */
 async function postEvents(req, res) {
   try {
-    const body = req.body;
-    res.status(200).json({ ok: true }); // ACK rápido
+    const body = req.body || {};
+    // Responder rápido a Meta
+    res.json({ ok: true });
 
-    if (!body || body.object !== 'whatsapp_business_account') return;
+    // WhatsApp Cloud -> entry/changes/value
+    const entry = Array.isArray(body.entry) && body.entry[0];
+    const changes = entry && Array.isArray(entry.changes) && entry.changes[0];
+    const value = changes && changes.value;
 
-    for (const entry of body.entry || []) {
-      for (const change of entry.changes || []) {
-        const value = change.value || {};
+    if (!value) return;
 
-        // Mensajes entrantes
-        if (Array.isArray(value.messages)) {
-          for (const msg of value.messages) {
-            const fromRaw = msg.from; // '519...'
-            const fromE164 = normalizeToE164(fromRaw);
-            const text = msg.text?.body || msg.button?.text || '';
-            const wamid = msg.id;
-            const profileName = value.contacts?.[0]?.profile?.name || null;
+    // Mensajes entrantes
+    if (Array.isArray(value.messages) && value.messages.length > 0) {
+      for (const m of value.messages) {
+        // Solo texto simple por ahora
+        if (m.type !== 'text') continue;
 
-            // 1) Contacto automático en Bitrix
-            try {
-              await ensureContactByPhone({ phoneE164: fromE164, name: profileName || fromE164 });
-            } catch (e) {
-              console.error('[contact:auto] error', e.message);
-            }
+        const wamid = m.id;
+        const fromRaw = m.from;               // MSISDN sin '+', ej: "51918131082"
+        const fromE164 = normalizeToE164(fromRaw, 'PE'); // "+51918131082"
+        const fromNoPlus = stripPlus(fromE164);          // "51918131082"
+        const text = m.text && m.text.body ? String(m.text.body) : '';
+        const profileName = value.contacts && value.contacts[0] && value.contacts[0].profile && value.contacts[0].profile.name;
 
-            // 2) Timeline local
-            await saveInboundMessage({ wamid, fromE164, text, profileName });
+        // Guardar timeline local
+        await appendInbound({
+          wamid,
+          from: fromE164,
+          text,
+          profileName: profileName || '',
+          ts: Date.now()
+        });
 
-            // 3) (opcional) marcar leído -> se puede implementar con llamada a /messages (Meta)
-            if (MARK_READ) {
-              // TODO: marcar leído si lo requieres
-            }
+        // Empujar a Bitrix (Open Line) como mensaje del cliente
+        try {
+          const connector = process.env.CONNECTOR_CODE || 'wa_cloud_custom';
+          const line = String(process.env.OPENLINE_ID || '').trim();
+          if (!connector || !line) {
+            console.warn('[WA→B24] faltan CONNECTOR_CODE u OPENLINE_ID en .env; se salta push');
+          } else {
+            const payload = {
+              CONNECTOR: connector,
+              LINE: line,
+              MESSAGES: [
+                {
+                  chat: { id: fromNoPlus }, // teléfono sin '+'
+                  message: {
+                    id: wamid,
+                    text: text,
+                    date: Math.floor(Date.now() / 1000)
+                  },
+                  user: {
+                    id: fromNoPlus,               // identificador del cliente en el conector
+                    name: profileName || fromE164 // nombre visible
+                  }
+                }
+              ]
+            };
+            const r = await call('imconnector.send.messages', payload);
+            console.log('[WA→B24] rx text ok', JSON.stringify(r));
           }
-        }
-
-        // Estados de entrega/lectura/error
-        if (Array.isArray(value.statuses)) {
-          for (const st of value.statuses) {
-            const wamid = st.id;
-            const phoneE164 = normalizeToE164(st.recipient_id);
-            const status = st.status; // sent/delivered/read/failed
-            const error = st.errors?.[0] ? JSON.stringify(st.errors[0]) : null;
-            await saveStatus({ wamid, phoneE164, status, error });
-          }
+        } catch (e) {
+          console.error('[WA→B24] rx text error', e?.response?.data || e.message || e);
         }
       }
     }
+
+    // Estados de entrega/lectura (opcional: guardar local)
+    if (Array.isArray(value.statuses) && value.statuses.length > 0) {
+      for (const s of value.statuses) {
+        await appendStatus({
+          wamid: s.id,
+          status: s.status,   // sent, delivered, read, failed
+          ts: Date.now(),
+          raw: s
+        });
+      }
+    }
   } catch (e) {
-    console.error('[wsp:webhook] error', e);
+    console.error('[wa:webhook] error', e?.response?.data || e.message || e);
+    // ya respondimos 200 arriba
   }
 }
 

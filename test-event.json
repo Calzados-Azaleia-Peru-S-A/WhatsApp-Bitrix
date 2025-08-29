@@ -1,0 +1,7 @@
+{
+  "event": "ONIMCONNECTORMESSAGEADD",
+  "data": {
+    "chat": { "id": "51918131082" },
+    "message": { "text": "Hola desde Bitrix -> WhatsApp (test local)" }
+  }
+}
