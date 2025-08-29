@@ -5,3 +5,7 @@ npm-debug.log*
 .env
 .env.*
 .runtime/
+.env
+.env.*
+.runtime/
+node_modules/
