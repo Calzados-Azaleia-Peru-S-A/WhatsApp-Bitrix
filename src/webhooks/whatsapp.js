@@ -1,76 +1,73 @@
 // src/webhooks/whatsapp.js
-// Webhook de META (entradas de WhatsApp) -> Open Lines (Bitrix)
+const { normalizeToE164 } = require('../utils/phone');
+const { saveInboundMessage, saveStatus } = require('../services/statusStore');
+const { ensureContactByPhone } = require('../services/contacts');
 
-const { sendToOpenLines, mapStatus } = require('../services/oc');
+const VERIFY_TOKEN = process.env.WSP_VERIFY_TOKEN || 'test123';
+const MARK_READ = String(process.env.WSP_MARK_READ || '1') === '1';
 
-function first(a) { return Array.isArray(a) ? a[0] : undefined; }
+async function getVerify(req, res) {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+  res.sendStatus(403);
+}
 
-module.exports = async function whatsappWebhook(req, res) {
+async function postEvents(req, res) {
   try {
-    const raw = req.body || {};
-    console.log('[WA webhook] raw:', JSON.stringify(raw));
+    const body = req.body;
+    res.status(200).json({ ok: true }); // ACK rápido
 
-    const entry = first(raw.entry) || {};
-    const change = first(entry.changes) || {};
-    const value = change.value || change || {};
-    const metadata = value.metadata || {};
-    const messages = value.messages || [];
+    if (!body || body.object !== 'whatsapp_business_account') return;
 
-    if (!messages.length) {
-      return res.status(200).json({ ok: true, processed: 0, results: [], errors: [] });
-    }
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value || {};
 
-    const results = [];
-    const errors = [];
+        // Mensajes entrantes
+        if (Array.isArray(value.messages)) {
+          for (const msg of value.messages) {
+            const fromRaw = msg.from; // '519...'
+            const fromE164 = normalizeToE164(fromRaw);
+            const text = msg.text?.body || msg.button?.text || '';
+            const wamid = msg.id;
+            const profileName = value.contacts?.[0]?.profile?.name || null;
 
-    for (const m of messages) {
-      try {
-        const from = m.from || m.contact?.wa_id || '';
-        const type = m.type || 'text';
-        const id = m.id || `wamid.LOCAL_${Date.now()}`;
-        let text = '';
+            // 1) Contacto automático en Bitrix
+            try {
+              await ensureContactByPhone({ phoneE164: fromE164, name: profileName || fromE164 });
+            } catch (e) {
+              console.error('[contact:auto] error', e.message);
+            }
 
-        if (type === 'text' && m.text?.body) {
-          text = m.text.body;
-        } else if (type === 'image') {
-          text = '📷 Imagen recibida';
-        } else if (type === 'document') {
-          text = `📄 Documento${m.document?.filename ? ': ' + m.document.filename : ''}`;
-        } else if (type === 'audio') {
-          text = '🎤 Audio recibido';
-        } else if (type === 'video') {
-          text = '🎬 Video recibido';
-        } else {
-          text = `[${type}] mensaje recibido`;
+            // 2) Timeline local
+            await saveInboundMessage({ wamid, fromE164, text, profileName });
+
+            // 3) (opcional) marcar leído -> se puede implementar con llamada a /messages (Meta)
+            if (MARK_READ) {
+              // TODO: marcar leído si lo requieres
+            }
+          }
         }
 
-        const r = await sendToOpenLines({
-          userId: from,
-          chatId: from,
-          text,
-          clientMsgId: id,
-        });
-
-        mapStatus.set(id, {
-          wa_from: from,
-          phone_id: metadata.phone_number_id,
-          display_number: metadata.display_phone_number,
-          result: r,
-        });
-
-        results.push({ type: 'message', messageId: id, result: r });
-      } catch (e) {
-        errors.push({
-          messageId: (m && m.id) || null,
-          error: (e && e.code) || (e && e.message) || 'UNKNOWN',
-          details: e?.response?.data || { error: e?.message },
-        });
+        // Estados de entrega/lectura/error
+        if (Array.isArray(value.statuses)) {
+          for (const st of value.statuses) {
+            const wamid = st.id;
+            const phoneE164 = normalizeToE164(st.recipient_id);
+            const status = st.status; // sent/delivered/read/failed
+            const error = st.errors?.[0] ? JSON.stringify(st.errors[0]) : null;
+            await saveStatus({ wamid, phoneE164, status, error });
+          }
+        }
       }
     }
-
-    return res.status(200).json({ ok: true, processed: results.length, results, errors });
   } catch (e) {
-    console.error('[WA webhook] fatal:', e);
-    return res.status(500).json({ ok: false, error: e.message });
+    console.error('[wsp:webhook] error', e);
   }
-};
+}
+
+module.exports = { getVerify, postEvents };
