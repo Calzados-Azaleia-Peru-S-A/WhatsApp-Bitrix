@@ -1,9 +1,29 @@
 // src/webhooks/whatsapp.js
 // Webhook de WhatsApp Cloud: verify + inbound -> Bitrix (imconnector.receiveMessage)
 
+const axios = require('axios');
 const { appendInbound, appendStatus } = require('../services/statusStore');
 const { normalizeToE164, stripPlus } = require('../utils/phone');
 const { call } = require('../services/b24client');
+
+async function fetchMediaInfo(id) {
+  try {
+    const token = process.env.WSP_TOKEN;
+    if (!id || !token) return null;
+    const url = `https://graph.facebook.com/v20.0/${id}`;
+    const { data } = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    return {
+      url: data.url,
+      mime_type: data.mime_type,
+      file_size: data.file_size
+    };
+  } catch (e) {
+    console.warn('[wa:webhook] fetchMediaInfo error', e?.response?.data || e.message || e);
+    return null;
+  }
+}
 
 /**
  * GET /webhooks/whatsapp (challenge)
@@ -39,15 +59,61 @@ async function postEvents(req, res) {
     // Mensajes entrantes
     if (Array.isArray(value.messages) && value.messages.length > 0) {
       for (const m of value.messages) {
-        // Solo texto simple por ahora
-        if (m.type !== 'text') continue;
-
         const wamid = m.id;
+        const type = m.type;
         const fromRaw = m.from;               // MSISDN sin '+', ej: "51918131082"
         const fromE164 = normalizeToE164(fromRaw, 'PE'); // "+51918131082"
         const fromNoPlus = stripPlus(fromE164);          // "51918131082"
-        const text = m.text && m.text.body ? String(m.text.body) : '';
         const profileName = value.contacts && value.contacts[0] && value.contacts[0].profile && value.contacts[0].profile.name;
+
+        let text = '';
+        let files = undefined;
+        let mediaMeta = undefined;
+
+        if (type === 'text') {
+          text = m.text && m.text.body ? String(m.text.body) : '';
+        } else if (type === 'image' || type === 'document' || type === 'audio') {
+          const mediaObj = m[type] || {};
+          text = mediaObj.caption || '';
+          const meta = await fetchMediaInfo(mediaObj.id);
+          if (!meta) continue;
+
+          const caps = {
+            image: Number(process.env.MEDIA_CAP_IMAGE_MB || 0),
+            document: Number(process.env.MEDIA_CAP_DOC_MB || 0),
+            audio: Number(process.env.MEDIA_CAP_AUDIO_MB || 0),
+          };
+          const maxBytes = caps[type] * 1024 * 1024;
+          if (maxBytes && meta.file_size && meta.file_size > maxBytes) {
+            console.warn(`[WA] ${type} excede tamaño permitido (${meta.file_size} > ${maxBytes})`);
+            continue;
+          }
+
+          const allowed = {
+            image: (process.env.MEDIA_TYPES_IMAGE || 'image/jpeg,image/png').split(','),
+            document: (process.env.MEDIA_TYPES_DOC || 'application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document').split(','),
+            audio: (process.env.MEDIA_TYPES_AUDIO || 'audio/ogg,audio/mpeg').split(','),
+          };
+          const mime = meta.mime_type || mediaObj.mime_type;
+          if (mime && allowed[type] && !allowed[type].includes(mime)) {
+            console.warn(`[WA] ${type} mime no permitido (${mime})`);
+            continue;
+          }
+
+          const filename = mediaObj.filename || `${type}-${wamid}`;
+          files = [{ name: filename, type: mime, link: meta.url, size: meta.file_size }];
+          mediaMeta = {
+            type,
+            id: mediaObj.id,
+            sha256: mediaObj.sha256,
+            mime_type: mime,
+            size: meta.file_size,
+            url: meta.url,
+            filename,
+          };
+        } else {
+          continue; // tipo no soportado
+        }
 
         // Guardar timeline local
         await appendInbound({
@@ -55,6 +121,7 @@ async function postEvents(req, res) {
           from: fromE164,
           text,
           profileName: profileName || '',
+          media: mediaMeta,
           ts: Date.now()
         });
 
@@ -65,17 +132,20 @@ async function postEvents(req, res) {
           if (!connector || !line) {
             console.warn('[WA→B24] faltan CONNECTOR_CODE u OPENLINE_ID en .env; se salta push');
           } else {
+            const message = {
+              id: wamid,
+              text: text,
+              date: Math.floor(Date.now() / 1000),
+            };
+            if (files) message.files = files;
+
             const payload = {
               CONNECTOR: connector,
               LINE: line,
               MESSAGES: [
                 {
                   chat: { id: fromNoPlus }, // teléfono sin '+'
-                  message: {
-                    id: wamid,
-                    text: text,
-                    date: Math.floor(Date.now() / 1000)
-                  },
+                  message,
                   user: {
                     id: fromNoPlus,               // identificador del cliente en el conector
                     name: profileName || fromE164 // nombre visible
@@ -84,10 +154,10 @@ async function postEvents(req, res) {
               ]
             };
             const r = await call('imconnector.send.messages', payload);
-            console.log('[WA→B24] rx text ok', JSON.stringify(r));
+            console.log(`[WA→B24] rx ${type} ok`, JSON.stringify(r));
           }
         } catch (e) {
-          console.error('[WA→B24] rx text error', e?.response?.data || e.message || e);
+          console.error(`[WA→B24] rx ${type} error`, e?.response?.data || e.message || e);
         }
       }
     }

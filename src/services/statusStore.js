@@ -31,7 +31,7 @@ function normalizeE164Maybe(s) {
 
 /**
  * Guarda un inbound (mensaje entrante de WhatsApp)
- * { wamid, from: '+51...', text, profileName, ts }
+ * { wamid, from: '+51...', text, profileName, ts, media? }
  */
 async function appendInbound(evt) {
   const row = {
@@ -40,7 +40,8 @@ async function appendInbound(evt) {
     from: normalizeE164Maybe(evt.from),
     text: evt.text || '',
     profileName: evt.profileName || '',
-    ts: Number(evt.ts || Date.now())
+    ts: Number(evt.ts || Date.now()),
+    media: evt.media || undefined
   };
   await appendLine(row);
   return row;
