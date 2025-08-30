@@ -25,6 +25,12 @@ app.post('/b24/events', b24.events);
 app.get('/b24/test', b24.test);
 app.get('/b24/debug', b24.debug);
 
+// Bitrix connector helper
+const connector = require('./webhooks/connector');
+app.get('/b24/connector/status', connector.status);
+app.post('/b24/connector/configure', connector.configure);
+app.post('/b24/connector/activate', connector.activate);
+
 // WhatsApp
 const wsp = require('./webhooks/whatsapp');
 app.get('/webhooks/whatsapp', wsp.getVerify);
@@ -60,6 +66,7 @@ const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
   console.log(`[b24-wsp] listo en http://localhost:${PORT}`);
   console.log(`[routes] GET/POST /b24/install | GET /b24/test | GET /b24/debug | POST /b24/events`);
+  console.log(`[routes] GET /b24/connector/status | POST /b24/connector/configure | POST /b24/connector/activate`);
   console.log(`[routes] GET /webhooks/whatsapp (challenge) | POST /webhooks/whatsapp`);
   console.log(`[routes] GET /wsp/send?to=+51...&text=...`);
 });
