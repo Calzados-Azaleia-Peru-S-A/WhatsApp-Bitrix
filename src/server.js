@@ -4,6 +4,7 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const express = require('express');   // 👈 se había borrado, vuelve aquí
 const morgan = require('morgan');
 const fs = require('fs-extra');
+const { sendToOpenLines } = require('./services/oc');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -62,6 +63,19 @@ app.get('/wsp/send', async (req, res) => {
   }
 });
 
+// Demo de envío a Open Lines
+app.post('/b24/imc/send-demo', async (req, res) => {
+  try {
+    const { to, text } = req.query;
+    const r = await sendToOpenLines({ userId: to, chatId: to, text: text || 'ping' });
+    console.log('[b24:imc:send-demo] ok', JSON.stringify(r));
+    res.json({ ok: true, result: r });
+  } catch (e) {
+    console.error('[b24:imc:send-demo] error', e?.response?.data || e.message || e);
+    res.status(500).json({ ok: false, error: e?.response?.data || e.message || String(e) });
+  }
+});
+
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
   console.log(`[b24-wsp] listo en http://localhost:${PORT}`);
@@ -69,6 +83,7 @@ app.listen(PORT, () => {
   console.log(`[routes] GET /b24/connector/status | POST /b24/connector/configure | POST /b24/connector/activate`);
   console.log(`[routes] GET /webhooks/whatsapp (challenge) | POST /webhooks/whatsapp`);
   console.log(`[routes] GET /wsp/send?to=+51...&text=...`);
+  console.log(`[routes] POST /b24/imc/send-demo?to=+51...&text=...`);
 });
 
 module.exports = app;
