@@ -1,0 +1,71 @@
+@echo off
+setlocal EnableExtensions
+REM === scripts\bind-placement.cmd ===
+REM Crea/actualiza el tile del Contact Center (OPENLINES_CONNECTOR -> /b24/connector-ui)
+
+REM Ir a la raíz del repo (carpeta del script -> ..)
+cd /d "%~dp0\.."
+
+REM --- 1) Cargar token y endpoint del archivo .runtime/b24-oauth.json ---
+for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "$j=Get-Content '.runtime/b24-oauth.json' ^| ConvertFrom-Json; $j.access_token"`) do set "B24_TOK=%%T"
+for /f "usebackq delims=" %%E in (`powershell -NoProfile -Command "$j=Get-Content '.runtime/b24-oauth.json' ^| ConvertFrom-Json; $j.client_endpoint"`) do set "B24_EP=%%E"
+
+if not defined B24_EP (
+  REM Fallback por si el JSON no trae endpoint
+  set "B24_EP=https://azaleia-peru.bitrix24.es/rest/"
+)
+
+REM --- 2) Configura TU dominio público del bridge (ngrok/custom) ---
+REM Cambia solo esta línea si usas otro subdominio o puerto
+set "APP_BASE=https://squirrel-talented-hermit.ngrok-free.app"
+
+REM Título que verás en el Tile del Contact Center
+set "TITLE=WA Cloud Custom"
+
+echo:
+echo ===== CONTEXTO =====
+echo EP=%B24_EP%
+for /f "delims=" %%# in ('cmd /v:on /c echo TOKEN(len)=!B24_TOK!^|set /a 0') do rem NOP
+echo APP_BASE=%APP_BASE%
+echo TITLE=%TITLE%
+echo =====================
+echo:
+
+if not defined B24_TOK (
+  echo [X] No se pudo cargar el access_token desde .runtime/b24-oauth.json
+  echo     Abre Bitrix -> Aplicaciones -> tu App local -> REINSTALAR, y vuelve a ejecutar.
+  goto :eof
+)
+
+REM --- 3) (Opcional) Desenlazar antes, por si ya existía con otra URL ---
+echo [step] placement.unbind (ignorar si da error)
+curl -s -X POST "%B24_EP%placement.unbind" ^
+  -H "Content-Type: application/x-www-form-urlencoded" ^
+  --data-urlencode "PLACEMENT=OPENLINES_CONNECTOR" ^
+  --data-urlencode "HANDLER=%APP_BASE%/b24/connector-ui" ^
+  --data-urlencode "auth=%B24_TOK%"
+echo:
+echo:
+
+REM --- 4) Enlazar el placement que crea el tile en Contact Center ---
+echo [step] placement.bind -> OPENLINES_CONNECTOR = %APP_BASE%/b24/connector-ui
+curl -s -X POST "%B24_EP%placement.bind" ^
+  -H "Content-Type: application/x-www-form-urlencoded" ^
+  --data-urlencode "PLACEMENT=OPENLINES_CONNECTOR" ^
+  --data-urlencode "HANDLER=%APP_BASE%/b24/connector-ui" ^
+  --data-urlencode "TITLE=%TITLE%" ^
+  --data-urlencode "auth=%B24_TOK%"
+echo:
+echo:
+
+REM --- 5) Comprobar los placements registrados ---
+echo [step] placement.list (verificacion)
+curl -s -X POST "%B24_EP%placement.list" ^
+  -H "Content-Type: application/x-www-form-urlencoded" ^
+  --data-urlencode "auth=%B24_TOK%"
+echo:
+echo:
+
+echo [OK] Si no ves errores arriba, vuelve al Contact Center.
+echo      Si el tile no aparece, hace logout/login y limpia cache del navegador.
+endlocal

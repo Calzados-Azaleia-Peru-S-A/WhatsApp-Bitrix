@@ -1,54 +1,68 @@
-// src/services/b24client.js
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
-const { ensureAccessToken, loadTokens } = require('./b24oauth');
+const qs = require('qs');
 
-const B24_DEBUG = String(process.env.B24_DEBUG || '0') === '1';
+// Ruta de tokens OAuth locales
+const tokPath = path.join(process.cwd(), '.runtime', 'b24-oauth.json');
 
-async function apiUrl(method) {
-  const tok = await loadTokens();
-  const domain = tok.domain || process.env.B24_DOMAIN || 'azaleia-peru.bitrix24.es';
-  return `https://${domain}/rest/${method}`;
-}
-
-async function call(method, params = {}) {
-  const url = await apiUrl(method);
-  const access_token = await ensureAccessToken();
-  const payload = { ...params, auth: access_token };
-  if (B24_DEBUG) {
-    console.log(`[B24] POST ${url} ${JSON.stringify(Object.keys(params))}`);
+function readTok() {
+  if (!fs.existsSync(tokPath)) {
+    throw new Error('No hay tokens en .runtime/b24-oauth.json. Reinstala la app o usa /b24/install.');
   }
-  const { data } = await axios.post(url, payload);
-  if (data.error) throw new Error(`[Bitrix24] ${data.error}: ${data.error_description}`);
-  return data.result;
+  return JSON.parse(fs.readFileSync(tokPath, 'utf8'));
 }
 
-// === CRM helpers ===
-
-async function findContactByPhone(phoneE164) {
-  // Bitrix no permite filter PHONE directo en /list, usamos filter[PHONE]=... (depende instancia).
-  const params = {
-    filter: { 'PHONE': phoneE164 },
-    select: ['ID','NAME','LAST_NAME','PHONE','EMAIL']
-  };
-  const res = await call('crm.contact.list', params);
-  if (Array.isArray(res) && res.length) return res[0];
-  return null;
+function baseUrl() {
+  const t = readTok();
+  return t.client_endpoint || `https://${t.domain}/rest/`;
 }
 
-async function createContact({ name, phoneE164 }) {
-  const fields = {
-    NAME: name || phoneE164,
-    OPENED: 'Y',
-    TYPE_ID: 'CLIENT',
-    SOURCE_ID: process.env.B24_SOURCE_ID || 'WHATSAPP',
-    PHONE: [{ VALUE: phoneE164, VALUE_TYPE: 'WORK' }]
-  };
-  const id = await call('crm.contact.add', { fields });
-  return id;
+// === LLAMADAS ===============================================================
+
+// Siempre enviar x-www-form-urlencoded con arrays tipo PHP
+async function callB24(method, params = {}) {
+  const t = readTok();
+  const url = `${baseUrl()}${method}`;
+
+  // Construimos payload con auth
+  const payload = { ...(params || {}), auth: t.access_token };
+
+  // Convertir a form-urlencoded con índices
+  const body = qs.stringify(payload, {
+    encodeValuesOnly: true,
+    arrayFormat: 'indices',
+  });
+
+  const res = await axios.post(url, body, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 20000,
+    validateStatus: () => true,
+  });
+
+  if (res.status !== 200) {
+    const msg = `HTTP ${res.status} calling ${method} -> ${JSON.stringify(res.data)}`;
+    const err = new Error(msg);
+    err.httpStatus = res.status;
+    err.responseBody = res.data;
+    throw err;
+  }
+  if (res.data && res.data.error) {
+    const err = new Error(res.data.error_description || res.data.error);
+    err.httpStatus = 400;
+    err.responseBody = res.data;
+    throw err;
+  }
+
+  return res.data?.result ?? res.data;
 }
+
+// Para que whatsapp.js sepa que esto usa form-urlencoded
+callB24.__usesFormUrlEncoded = true;
 
 module.exports = {
-  call,
-  findContactByPhone,
-  createContact
+  callB24,
+  baseUrl,
 };

@@ -1,111 +1,59 @@
 // src/services/statusStore.js
-// Almacenamiento simple tipo JSONL para timeline y estados.
+// Persistencia ligera: timeline (status.jsonl) + mapa wamid <-> im.message_id (outbound-map.json)
 
-const path = require('path');
 const fs = require('fs-extra');
+const path = require('path');
 
 const RUNTIME_DIR = process.env.RUNTIME_DIR || '.runtime';
-const LOG_FILE = path.join(RUNTIME_DIR, 'status.jsonl');
+const TIMELINE_FILE = path.join(RUNTIME_DIR, 'status.jsonl');
+const MAP_FILE = path.join(RUNTIME_DIR, 'outbound-map.json');
 
-// Asegura carpeta/archivo al cargar el módulo
 fs.ensureDirSync(RUNTIME_DIR);
-fs.ensureFileSync(LOG_FILE);
 
-/**
- * Escribe una línea JSON en status.jsonl
- */
-async function appendLine(obj) {
-  const line = JSON.stringify(obj) + '\n';
-  await fs.appendFile(LOG_FILE, line, 'utf8');
-}
-
-/**
- * Normaliza número a formato E.164 si ya viene con '+'
- * (si necesitas más lógica, centralízala en utils/phone)
- */
-function normalizeE164Maybe(s) {
-  if (!s) return null;
-  const str = String(s).trim();
-  return str.startsWith('+') ? str : str;
-}
-
-/**
- * Guarda un inbound (mensaje entrante de WhatsApp)
- * { wamid, from: '+51...', text, profileName, ts }
- */
+/** Apéndice para inbound timeline (auditoría local) */
 async function appendInbound(evt) {
-  const row = {
-    type: 'inbound',
-    wamid: evt.wamid || null,
-    from: normalizeE164Maybe(evt.from),
-    text: evt.text || '',
-    profileName: evt.profileName || '',
-    ts: Number(evt.ts || Date.now())
-  };
-  await appendLine(row);
-  return row;
+  const line = JSON.stringify({ type: 'inbound', ...evt }) + '\n';
+  await fs.appendFile(TIMELINE_FILE, line);
 }
 
-/**
- * Guarda un estado (sent/delivered/read/failed)
- * { wamid, status, ts, raw? }
- */
+/** Apéndice de estados (auditoría local) */
 async function appendStatus(evt) {
-  const row = {
-    type: 'status',
-    wamid: evt.wamid || null,
-    status: evt.status || '',
-    ts: Number(evt.ts || Date.now()),
-    raw: evt.raw || undefined
-  };
-  await appendLine(row);
-  return row;
+  const line = JSON.stringify({ type: 'status', ...evt }) + '\n';
+  await fs.appendFile(TIMELINE_FILE, line);
 }
 
-/**
- * Lee el archivo completo como array de objetos (cuidado con tamaño).
- * Para este proyecto basta y sobra; si crece, podemos indexar.
- */
-async function readAll() {
-  const exists = await fs.pathExists(LOG_FILE);
-  if (!exists) return [];
-  const content = await fs.readFile(LOG_FILE, 'utf8');
-  const lines = content.split('\n').filter(Boolean);
-  const out = [];
-  for (const ln of lines) {
-    try { out.push(JSON.parse(ln)); } catch { /* ignora líneas corruptas */ }
+/** Carga mapa (si no existe, objeto vacío) */
+async function loadMap() {
+  try {
+    const raw = await fs.readFile(MAP_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
   }
-  return out;
 }
 
-/**
- * Busca todas las entradas por WAMID (puede haber varios estados para 1 wamid)
- */
-async function getStatusByMessageId(wamid) {
-  if (!wamid) return [];
-  const all = await readAll();
-  return all.filter(r => r.wamid === wamid);
+/** Guarda mapa completo */
+async function saveMap(obj) {
+  await fs.writeFile(MAP_FILE, JSON.stringify(obj, null, 2));
 }
 
-/**
- * Devuelve el timeline por número E.164 (+51...), ordenado por ts asc
- */
-async function getTimelineByPhone(phoneE164) {
-  if (!phoneE164) return [];
-  const e164 = normalizeE164Maybe(phoneE164);
-  const all = await readAll();
-  const filtered = all.filter(r => r.from === e164);
-  // orden cronológico
-  filtered.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
-  return filtered;
+/** Guarda relación wamid -> { imMsgId, chatId }  (chatId = id del chat en Bitrix, sin '+') */
+async function saveOutboundMap({ wamid, imMsgId, chatId }) {
+  if (!wamid || !imMsgId || !chatId) return;
+  const map = await loadMap();
+  map[wamid] = { imMsgId: String(imMsgId), chatId: String(chatId) };
+  await saveMap(map);
+}
+
+/** Busca relación por wamid */
+async function findOutboundMap(wamid) {
+  const map = await loadMap();
+  return map[wamid] || null;
 }
 
 module.exports = {
   appendInbound,
   appendStatus,
-  getStatusByMessageId,
-  getTimelineByPhone,
-  // por si sirve exportar también constantes
-  LOG_FILE,
-  RUNTIME_DIR,
+  saveOutboundMap,
+  findOutboundMap
 };

@@ -1,79 +1,145 @@
 // src/services/b24oauth.js
-const fs = require('fs-extra');
+// Manejo de tokens OAuth de Bitrix24: snapshot, refresh y utilidades.
+
+const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 
-const RUNTIME_DIR = process.env.RUNTIME_DIR || '.runtime';
-const TOK_FILE = path.join(RUNTIME_DIR, 'b24-oauth.json');
+const RUNTIME_DIR = path.join(process.cwd(), '.runtime');
+const TOKEN_FILE = path.join(RUNTIME_DIR, 'b24-oauth.json');
 
-const B24_DOMAIN_ENV = process.env.B24_DOMAIN || 'azaleia-peru.bitrix24.es';
-const CLIENT_ID = process.env.B24_CLIENT_ID;
-const CLIENT_SECRET = process.env.B24_CLIENT_SECRET;
-const APP_PUBLIC_BASE = process.env.APP_PUBLIC_BASE;
-
-function getRedirectUri() {
-  return `${APP_PUBLIC_BASE}/b24/install`;
+// Asegura carpeta .runtime
+if (!fs.existsSync(RUNTIME_DIR)) {
+  fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 }
 
-async function loadTokens() {
-  try { return await fs.readJson(TOK_FILE); } catch { return {}; }
-}
-async function saveTokens(obj) {
-  await fs.ensureFile(TOK_FILE);
-  await fs.writeJson(TOK_FILE, obj, { spaces: 2 });
-  return obj;
+/** Carga tokens de disco */
+function loadTokenFromDisk() {
+  try {
+    if (!fs.existsSync(TOKEN_FILE)) return null;
+    const raw = fs.readFileSync(TOKEN_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error('[b24oauth] loadTokenFromDisk error', e);
+    return null;
+  }
 }
 
-async function exchangeCodeForTokens(code) {
-  const url = 'https://oauth.bitrix.info/oauth/token/';
-  const params = {
-    grant_type: 'authorization_code',
+/** Guarda tokens en disco con ts_saved */
+function saveTokenSnapshot(obj) {
+  try {
+    const payload = { ...obj, ts_saved: Date.now() };
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(payload, null, 2), 'utf8');
+    return payload;
+  } catch (e) {
+    console.error('[b24oauth] saveTokenSnapshot error', e);
+    throw e;
+  }
+}
+
+/** Resumen simple para /b24/token-info */
+function getTokenSnapshot() {
+  const t = loadTokenFromDisk();
+  if (!t) {
+    return {
+      has_access_token: false,
+      has_refresh_token: false,
+    };
+  }
+  return {
+    has_access_token: !!t.access_token,
+    has_refresh_token: !!t.refresh_token,
+    expires_in: t.expires_in,
+    ts_saved: t.ts_saved,
+    domain: t.domain,
+    client_endpoint: t.client_endpoint ? '(set)' : '(unset)',
+    server_endpoint: t.server_endpoint ? '(set)' : '(unset)',
+    member_id: t.member_id ? '(set)' : '(unset)',
+  };
+}
+
+/** Calcula si el token expiró o va a expirar pronto (tolerancia 60s) */
+function isTokenExpiringSoon(t) {
+  if (!t) return true;
+  const now = Math.floor(Date.now() / 1000);
+  // Bitrix a veces guarda "expires" absoluto; si no, calculamos con obtained_at+expires_in
+  const exp = t.expires
+    ? Number(t.expires)
+    : (t.obtained_at ? Math.floor(t.obtained_at / 1000) : now) + (Number(t.expires_in) || 0);
+  return exp - now <= 60; // menos de 60s
+}
+
+/** Fuerza refresh contra oauth.bitrix.info */
+async function forceRefresh() {
+  const CLIENT_ID = process.env.B24_CLIENT_ID;
+  const CLIENT_SECRET = process.env.B24_CLIENT_SECRET;
+
+  const current = loadTokenFromDisk();
+  if (!CLIENT_ID || !CLIENT_SECRET || !current?.refresh_token) {
+    const err = new Error('Faltan B24_CLIENT_ID / B24_CLIENT_SECRET o refresh_token.');
+    err.code = 'REFRESH_CONFIG_MISSING';
+    throw err;
+  }
+
+  const params = new URLSearchParams({
+    grant_type: 'refresh_token',
     client_id: CLIENT_ID,
     client_secret: CLIENT_SECRET,
-    code,
-    redirect_uri: getRedirectUri(),
-  };
-  const { data } = await axios.post(url, null, { params });
-  if (data.error) throw new Error(`${data.error}: ${data.error_description}`);
-  return saveTokens({
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
-    expires_in: data.expires_in,
-    domain: data.domain || B24_DOMAIN_ENV,
-    obtained_at: Date.now(),
+    refresh_token: current.refresh_token,
   });
-}
 
-async function saveTokensFromInstallEvent(auth) {
-  if (!auth || !auth.access_token) throw new Error('ONAPPINSTALL sin auth.access_token');
-  const obj = {
-    access_token: auth.access_token,
-    refresh_token: auth.refresh_token || null,
-    expires_in: Number(auth.expires_in || 3600),
-    domain: auth.domain || B24_DOMAIN_ENV,
-    obtained_at: Date.now(),
+  const url = 'https://oauth.bitrix.info/oauth/token/';
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    const err = new Error(`Refresh HTTP ${res.status}: ${txt}`);
+    err.code = 'REFRESH_HTTP_ERROR';
+    throw err;
+  }
+
+  const json = await res.json();
+  const merged = {
+    ...current,
+    ...json,                // access_token, refresh_token, expires_in, scope, domain?, client_endpoint?, server_endpoint?, member_id?, user_id?
+    obtained_at: Date.now()
   };
-  return saveTokens(obj);
+  saveTokenSnapshot(merged);
+
+  return {
+    refreshed_at: Date.now(),
+    domain: merged.domain || 'oauth.bitrix.info',
+    client_endpoint: merged.client_endpoint || '(unset)',
+    server_endpoint: merged.server_endpoint || '(unset)',
+  };
 }
 
-function isExpired(tok) {
-  if (!tok.access_token || !tok.expires_in || !tok.obtained_at) return true;
-  const skew = 60;
-  return (Date.now() / 1000) > (tok.obtained_at / 1000 + tok.expires_in - skew);
-}
-
-async function ensureAccessToken() {
-  const tok = await loadTokens();
-  if (!tok.access_token) throw new Error('Sin access_token. Autoriza en /b24/install (REINSTALAR en Bitrix).');
-  if (isExpired(tok)) throw new Error('Token expirado. Pulsa REINSTALAR para renovar.');
-  return tok.access_token;
+/**
+ * Asegura que el access_token esté fresco.
+ * - Si expira pronto, intenta forceRefresh().
+ * - Devuelve el snapshot actualizado de tokens.
+ */
+async function ensureFreshToken() {
+  let t = loadTokenFromDisk();
+  if (!t) {
+    const err = new Error('Snapshot de token ausente. Reinstala la app en Bitrix.');
+    err.code = 'TOKEN_SNAPSHOT_MISSING';
+    throw err;
+  }
+  if (isTokenExpiringSoon(t)) {
+    await forceRefresh();
+    t = loadTokenFromDisk();
+  }
+  return t;
 }
 
 module.exports = {
-  getRedirectUri,
-  exchangeCodeForTokens,
-  saveTokensFromInstallEvent,
-  ensureAccessToken,
-  loadTokens,
-  saveTokens,
+  loadTokenFromDisk,
+  saveTokenSnapshot,
+  getTokenSnapshot,
+  forceRefresh,
+  ensureFreshToken, // <- EXPORTADO para que bitrix.js lo use
 };

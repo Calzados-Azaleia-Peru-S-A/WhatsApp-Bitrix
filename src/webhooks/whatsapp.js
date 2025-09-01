@@ -1,111 +1,133 @@
-// src/webhooks/whatsapp.js
-// Webhook de WhatsApp Cloud: verify + inbound -> Bitrix (imconnector.receiveMessage)
+﻿// src/webhooks/whatsapp.js
+// Webhook WhatsApp -> Bitrix24 (imconnector.send.messages) usando claves MAYÚSCULAS
+// y x-www-form-urlencoded (php indices) para MESSAGES[*].
 
-const { appendInbound, appendStatus } = require('../services/statusStore');
-const { normalizeToE164, stripPlus } = require('../utils/phone');
-const { call } = require('../services/b24client');
+'use strict';
 
-/**
- * GET /webhooks/whatsapp (challenge)
- */
+const qs = require('qs');
+let b24client = {};
+let b24oauth = {};
+try { b24client = require('../services/b24client'); } catch {}
+try { b24oauth = require('../services/b24oauth'); } catch {}
+
+const ensureFreshToken = b24oauth?.ensureFreshToken;
+
+// ENV
+const VERIFY_TOKEN = process.env.WSP_VERIFY_TOKEN || 'test123';
+const CONNECTOR = process.env.CONNECTOR_CODE || 'wa_cloud_custom';
+const LINE = process.env.OPENLINE_ID || process.env.OPENLINE || '154';
+const APP_PUBLIC_BASE = (process.env.APP_PUBLIC_BASE || '').replace(/\/$/, '');
+
+// ------- helpers -------
+function textForMedia(msg) {
+  let caption = msg?.image?.caption || msg?.video?.caption || msg?.document?.caption || msg?.audio?.caption || '';
+  let mediaUrl = msg?.image?.url || msg?.video?.url || msg?.document?.url || msg?.audio?.url || '';
+  const mediaId = msg?.image?.id || msg?.video?.id || msg?.document?.id || msg?.audio?.id || msg?.sticker?.id || '';
+  if (!mediaUrl && APP_PUBLIC_BASE && mediaId) {
+    mediaUrl = `${APP_PUBLIC_BASE}/media/wsp/${encodeURIComponent(mediaId)}?filename=${encodeURIComponent('media_'+mediaId)}`;
+  }
+  const parts = [];
+  if (caption && caption.trim()) parts.push(caption.trim());
+  if (mediaUrl) parts.push(mediaUrl);
+  return parts.join('\n') || '[media]';
+}
+
+function toUpperMessage(waMsg) {
+  const phone = (waMsg?.from || '').replace(/^\+/, '');
+  const type = waMsg?.type;
+  let text = '';
+  if (type === 'text') {
+    text = waMsg?.text?.body || '';
+  } else if (['image','video','audio','document','sticker'].includes(type)) {
+    text = textForMedia(waMsg);
+  } else if (type === 'location') {
+    const loc = waMsg.location || {};
+    text = `Ubicación: ${loc.latitude},${loc.longitude}${loc.name ? ' - '+loc.name : ''}${loc.address ? ' - '+loc.address : ''}`;
+  } else if (type === 'contacts') {
+    text = '[contact]';
+  } else if (type === 'interactive' || type === 'button') {
+    text = '[interactive]';
+  } else {
+    text = '[mensaje]';
+  }
+
+  // Estructura en MAYÚSCULAS
+  return {
+    USER: { ID: phone },
+    CHAT: { ID: phone },
+    MESSAGE: {
+      ID: waMsg?.id || `wamid.AUTO.${Date.now()}`,
+      TEXT: text,
+      DATE: { TIMESTAMP: Math.floor(Date.now() / 1000) }
+    }
+  };
+}
+
+async function callB24Form(method, params) {
+  // Siempre x-www-form-urlencoded con indices
+  let tk;
+  if (typeof b24client?.__usesFormUrlEncoded === 'boolean' && typeof b24client?.callB24 === 'function') {
+    return b24client.callB24(method, params);
+  } else if (typeof ensureFreshToken === 'function') {
+    tk = await ensureFreshToken();
+    const endpoint = (tk.client_endpoint || '').replace(/\/?$/, '/');
+    const url = endpoint + method;
+    const body = qs.stringify({ ...(params || {}), auth: tk.access_token }, { encodeValuesOnly: true, arrayFormat: 'indices' });
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    const j = await r.json().catch(async () => ({ error: 'HTTP_'+r.status, raw: await r.text() }));
+    if (j?.error) throw new Error(j.error_description || j.error);
+    return j?.result ?? j;
+  } else {
+    throw new Error('Tokens no disponibles');
+  }
+}
+
+// ------- handlers -------
 async function getVerify(req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === process.env.WSP_VERIFY_TOKEN && challenge) {
-    return res.status(200).send(challenge);
-  }
-  return res.status(403).send('forbidden');
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge || 'ok');
+  return res.status(403).send('Forbidden');
 }
 
-/**
- * POST /webhooks/whatsapp
- * Maneja mensajes entrantes y estados.
- * Empuja mensajes entrantes a Bitrix: imconnector.receiveMessage
- */
 async function postEvents(req, res) {
   try {
-    const body = req.body || {};
-    // Responder rápido a Meta
-    res.json({ ok: true });
+    res.json({ ok: true }); // responder rápido
+    const entries = req.body?.entry || [];
+    for (const entry of entries) {
+      const changes = entry?.changes || [];
+      for (const ch of changes) {
+        const val = ch?.value || {};
+        const messages = val?.messages || [];
+        for (const m of messages) {
+          const item = toUpperMessage(m);
 
-    // WhatsApp Cloud -> entry/changes/value
-    const entry = Array.isArray(body.entry) && body.entry[0];
-    const changes = entry && Array.isArray(entry.changes) && entry.changes[0];
-    const value = changes && changes.value;
+          const payload = {
+            CONNECTOR,
+            LINE,
+            MESSAGES: [ item ]
+          };
 
-    if (!value) return;
+          console.log('[WA->B24] sending', JSON.stringify({
+            CONNECTOR: payload.CONNECTOR,
+            LINE: payload.LINE,
+            sampleKeys: Object.keys(item),
+            msgKeys: Object.keys(item.MESSAGE),
+            upper: true
+          }));
 
-    // Mensajes entrantes
-    if (Array.isArray(value.messages) && value.messages.length > 0) {
-      for (const m of value.messages) {
-        // Solo texto simple por ahora
-        if (m.type !== 'text') continue;
-
-        const wamid = m.id;
-        const fromRaw = m.from;               // MSISDN sin '+', ej: "51918131082"
-        const fromE164 = normalizeToE164(fromRaw, 'PE'); // "+51918131082"
-        const fromNoPlus = stripPlus(fromE164);          // "51918131082"
-        const text = m.text && m.text.body ? String(m.text.body) : '';
-        const profileName = value.contacts && value.contacts[0] && value.contacts[0].profile && value.contacts[0].profile.name;
-
-        // Guardar timeline local
-        await appendInbound({
-          wamid,
-          from: fromE164,
-          text,
-          profileName: profileName || '',
-          ts: Date.now()
-        });
-
-        // Empujar a Bitrix (Open Line) como mensaje del cliente
-        try {
-          const connector = process.env.CONNECTOR_CODE || 'wa_cloud_custom';
-          const line = String(process.env.OPENLINE_ID || '').trim();
-          if (!connector || !line) {
-            console.warn('[WA→B24] faltan CONNECTOR_CODE u OPENLINE_ID en .env; se salta push');
-          } else {
-            const payload = {
-              CONNECTOR: connector,
-              LINE: line,
-              MESSAGES: [
-                {
-                  chat: { id: fromNoPlus }, // teléfono sin '+'
-                  message: {
-                    id: wamid,
-                    text: text,
-                    date: Math.floor(Date.now() / 1000)
-                  },
-                  user: {
-                    id: fromNoPlus,               // identificador del cliente en el conector
-                    name: profileName || fromE164 // nombre visible
-                  }
-                }
-              ]
-            };
-            const r = await call('imconnector.send.messages', payload);
-            console.log('[WA→B24] rx text ok', JSON.stringify(r));
+          try {
+            const resp = await callB24Form('imconnector.send.messages', payload);
+            console.log('[WA->B24] ok', JSON.stringify(resp));
+          } catch (e) {
+            console.error('[WA->B24] error', e?.message || e);
           }
-        } catch (e) {
-          console.error('[WA→B24] rx text error', e?.response?.data || e.message || e);
         }
       }
     }
-
-    // Estados de entrega/lectura (opcional: guardar local)
-    if (Array.isArray(value.statuses) && value.statuses.length > 0) {
-      for (const s of value.statuses) {
-        await appendStatus({
-          wamid: s.id,
-          status: s.status,   // sent, delivered, read, failed
-          ts: Date.now(),
-          raw: s
-        });
-      }
-    }
   } catch (e) {
-    console.error('[wa:webhook] error', e?.response?.data || e.message || e);
-    // ya respondimos 200 arriba
+    console.error('[whatsapp webhook] fatal', e);
   }
 }
 
