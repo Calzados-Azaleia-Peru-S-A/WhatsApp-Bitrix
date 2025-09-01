@@ -1,7 +1,7 @@
 // src/webhooks/connector.js
 // Rutas para administrar el conector personalizado de Bitrix24
 
-const { call } = require('../services/b24client');
+const { callB24 } = require('../services/b24client');
 
 // GET /b24/connector/status
 async function status(req, res) {

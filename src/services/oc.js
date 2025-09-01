@@ -1,7 +1,7 @@
 // src/services/oc.js
 // Envío estable a Open Lines (Bitrix) usando SIEMPRE el payload tipo "B"
 
-const { call } = require('../../services/b24client');
+const { callB24 } = require('./b24client');
 
 const CONNECTOR = process.env.CONNECTOR_CODE || 'wa_cloud_custom';
 const OPENLINE_ID = Number(process.env.OPENLINE_ID || 0);
